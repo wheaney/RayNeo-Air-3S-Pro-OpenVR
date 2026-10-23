@@ -26,6 +26,24 @@ static const char *rayneoUsbErr(int code)
 {
     return libusb_error_name(code);
 }
+
+static bool rayneoDebugEnabled()
+{
+    static const bool enabled = (std::getenv("RAYNEO_DEBUG") != nullptr);
+    return enabled;
+}
+
+static void rayneoLog(const char *fmt, ...)
+{
+    if (!rayneoDebugEnabled())
+        return;
+    va_list args;
+    va_start(args, fmt);
+    std::fprintf(stderr, "[RayNeoSDK] ");
+    std::vfprintf(stderr, fmt, args);
+    va_end(args);
+    std::fflush(stderr);
+}
 #endif
 
 struct RayneoContext__
@@ -33,6 +51,7 @@ struct RayneoContext__
     uint16_t vid{0};
     uint16_t pid{0};
     std::atomic<bool> running{false};
+    std::atomic<bool> imuEnabled{false};
     RAYNEO_EventCallback cb{nullptr};
     void *cbUser{nullptr};
     int logLevel{2};
@@ -831,6 +850,96 @@ RAYNEO_Result Rayneo_SetLogLevel(int level)
     return RAYNEO_OK;
 }
 
+#ifndef __APPLE__
+// One transport bring-up cycle: claim the interface (which detaches the
+// kernel HID driver), release it, reset the port (reopening on
+// re-enumeration), then claim it again for good.
+//
+// Quirk observed on the GT Max: while a kernel HID driver has been bound
+// since enumeration, the firmware ignores all usbfs traffic (interrupt OUT
+// writes NAK until timeout, GET/SET_REPORT control requests STALL). The
+// claim/release + port reset sequence brings the firmware's command path
+// up; a port reset on its own does not clear this state.
+static RAYNEO_Result rayneoTransportBringUp(RayneoContext__ *ctx)
+{
+    if (!ctx || !ctx->handle || ctx->interfaceNumber < 0)
+        return RAYNEO_ERR_INVALID_ARG;
+
+    libusb_set_auto_detach_kernel_driver(ctx->handle, 1);
+
+    int cRc = libusb_claim_interface(ctx->handle, ctx->interfaceNumber);
+    rayneoLog("claim#1 rc=%d (%s)\n", cRc, cRc == 0 ? "ok" : rayneoUsbErr(cRc));
+    if (cRc == 0)
+    {
+        libusb_release_interface(ctx->handle, ctx->interfaceNumber);
+        rayneoLog("release#1 ok\n");
+    }
+
+    for (int attempt = 0; attempt < 3; attempt++)
+    {
+        int rRc = libusb_reset_device(ctx->handle);
+        rayneoLog("reset_device rc=%d (%s)\n", rRc, rRc == 0 ? "ok" : rayneoUsbErr(rRc));
+        if (rRc == 0)
+            break;
+        if (rRc != LIBUSB_ERROR_NOT_FOUND)
+            break;
+
+        // Device re-enumerated at a different address; reopen it.
+        libusb_close(ctx->handle);
+        ctx->handle = nullptr;
+        libusb_device **relist = nullptr;
+        ssize_t ren = libusb_get_device_list(ctx->usbCtx, &relist);
+        libusb_device *retarget = nullptr;
+        for (ssize_t i = 0; i < ren; i++)
+        {
+            libusb_device_descriptor desc{};
+            if (libusb_get_device_descriptor(relist[i], &desc) == 0 &&
+                desc.idVendor == ctx->vid && desc.idProduct == ctx->pid)
+            {
+                retarget = relist[i];
+                break;
+            }
+        }
+        if (!retarget)
+        {
+            rayneoLog("device disappeared after reset\n");
+            libusb_free_device_list(relist, 1);
+            return RAYNEO_ERR_NO_DEVICE;
+        }
+        if (libusb_open(retarget, &ctx->handle) != 0 || !ctx->handle)
+        {
+            rayneoLog("libusb_open after reset failed\n");
+            libusb_free_device_list(relist, 1);
+            return RAYNEO_ERR_IO;
+        }
+        libusb_free_device_list(relist, 1);
+        libusb_set_auto_detach_kernel_driver(ctx->handle, 1);
+    }
+
+    cRc = LIBUSB_ERROR_BUSY;
+    // The kernel may briefly rebind its driver after the port reset;
+    // retry the claim for up to ~3s in that case.
+    for (int attempt = 0; attempt < 30; attempt++)
+    {
+        cRc = libusb_claim_interface(ctx->handle, ctx->interfaceNumber);
+        if (cRc != LIBUSB_ERROR_BUSY)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    rayneoLog("claim#2 rc=%d (%s)\n", cRc, cRc == 0 ? "ok" : rayneoUsbErr(cRc));
+    if (cRc != 0)
+        return RAYNEO_ERR_IO;
+
+    if (ctx->altSetting >= 0)
+    {
+        int aRc = libusb_set_interface_alt_setting(ctx->handle, ctx->interfaceNumber, ctx->altSetting);
+        if (aRc != 0)
+            rayneoLog("set_interface_alt_setting rc=%d (%s)\n", aRc, rayneoUsbErr(aRc));
+    }
+    return RAYNEO_OK;
+}
+#endif
+
 RAYNEO_Result Rayneo_Start(RAYNEO_Context ctx, uint32_t /*serviceFlags*/)
 {
     if (!ctx)
@@ -847,6 +956,7 @@ RAYNEO_Result Rayneo_Start(RAYNEO_Context ctx, uint32_t /*serviceFlags*/)
         ctx->running.store(false);
         return RAYNEO_ERR_GENERAL;
     }
+    rayneoLog("libusb_init ok, searching for %04x:%04x\n", ctx->vid, ctx->pid);
     libusb_device **list = nullptr;
     ssize_t n = libusb_get_device_list(ctx->usbCtx, &list);
     libusb_device *target = nullptr;
@@ -866,16 +976,19 @@ RAYNEO_Result Rayneo_Start(RAYNEO_Context ctx, uint32_t /*serviceFlags*/)
     if (!target)
     {
         // target not found
+        rayneoLog("device %04x:%04x not found in %zd usb devices\n", ctx->vid, ctx->pid, n);
         libusb_free_device_list(list, 1);
         ctx->running.store(false);
         return RAYNEO_ERR_NO_DEVICE;
     }
     if (libusb_open(target, &ctx->handle) != 0 || !ctx->handle)
     {
+        rayneoLog("libusb_open failed\n");
         libusb_free_device_list(list, 1);
         ctx->running.store(false);
         return RAYNEO_ERR_IO;
     }
+    rayneoLog("libusb_open ok\n");
     libusb_free_device_list(list, 1);
     ctx->interfaceNumber = -1;
     ctx->altSetting = -1;
@@ -928,6 +1041,8 @@ RAYNEO_Result Rayneo_Start(RAYNEO_Context ctx, uint32_t /*serviceFlags*/)
         }
         libusb_free_config_descriptor(cfg);
     }
+    rayneoLog("selected interface=%d alt=%d epIn=0x%02x epOut=0x%02x maxPacket=%u (exactTarget=%d)\n",
+              ctx->interfaceNumber, ctx->altSetting, ctx->epIn, ctx->epOut, ctx->epInMaxPacket, (int)exactTarget);
     if (exactTarget && ctx->interfaceNumber < 0)
     {
         libusb_close(ctx->handle);
@@ -939,18 +1054,95 @@ RAYNEO_Result Rayneo_Start(RAYNEO_Context ctx, uint32_t /*serviceFlags*/)
     }
     if (ctx->interfaceNumber >= 0)
     {
-        libusb_set_auto_detach_kernel_driver(ctx->handle, 1);
+        // Bring the transport up and make sure the IMU stream is running.
+        // On a fresh attach the IMU-on command succeeds once the command
+        // path is up. While the firmware is already streaming (e.g. the
+        // driver restarted without a replug), the command endpoint is
+        // locked (NAK/STALL) but the IMU stream can simply be picked up.
+        RAYNEO_Result bringUp = RAYNEO_ERR_GENERAL;
+        bool imuRunning = false;
+        for (int attempt = 0; attempt < 3 && !imuRunning; attempt++)
+        {
+            bringUp = rayneoTransportBringUp(ctx);
+            if (bringUp != RAYNEO_OK)
+            {
+                libusb_close(ctx->handle);
+                ctx->handle = nullptr;
+                libusb_exit(ctx->usbCtx);
+                ctx->usbCtx = nullptr;
+                ctx->running.store(false);
+                return bringUp;
+            }
 
-        int active = libusb_kernel_driver_active(ctx->handle, ctx->interfaceNumber);
-        if (active == 1)
-        {
-            libusb_detach_kernel_driver(ctx->handle, ctx->interfaceNumber);
-        }
-        
-        int cRc = libusb_claim_interface(ctx->handle, ctx->interfaceNumber);
-        if (cRc == 0 && ctx->altSetting >= 0)
-        {
-            libusb_set_interface_alt_setting(ctx->handle, ctx->interfaceNumber, ctx->altSetting);
+            uint8_t probe[64] = {0};
+            probe[0] = 0x66;
+            probe[1] = 0x01; // IMU on
+            probe[2] = 0x00;
+            int transferred = 0;
+            int pRc = ctx->epOut
+                ? libusb_interrupt_transfer(ctx->handle, ctx->epOut, probe, 64, &transferred, 500)
+                : LIBUSB_ERROR_NOT_SUPPORTED;
+            rayneoLog("imu-on probe attempt=%d rc=%d (%s)\n", attempt, pRc, pRc == 0 ? "ok" : rayneoUsbErr(pRc));
+            if (pRc == 0 && transferred == 64)
+            {
+                ctx->imuEnabled = true;
+                break;
+            }
+
+            // Maybe the IMU stream is already running.
+            unsigned char chk[64] = {0};
+            int chkLen = 0;
+            int sRc = libusb_interrupt_transfer(ctx->handle, ctx->epIn, chk, 64, &chkLen, 1500);
+            rayneoLog("stream check attempt=%d rc=%d len=%d type=0x%02x\n", attempt, sRc, chkLen,
+                      (sRc == 0 && chkLen > 1) ? chk[1] : 0);
+            if (sRc == 0 && chkLen >= 2 && chk[1] == RAYNEO_PROTO_ACK_IMU_DATA)
+            {
+                ctx->imuEnabled = true;
+                imuRunning = true;
+                break;
+            }
+
+            // The firmware has its IMU enabled but suspended the stream
+            // (observed after a driver restart without a replug). Reconfiguring
+            // the device (unconfigure + configure) revives the stream even
+            // though the command endpoint stays locked while streaming.
+            rayneoLog("trying unconfigure/reconfigure\n");
+            int uRc = libusb_control_transfer(ctx->handle, 0x00, 0x09, 0, 0, nullptr, 0, 1000);
+            rayneoLog("raw set_config(0) rc=%d (%s)\n", uRc, uRc >= 0 ? "ok" : rayneoUsbErr(uRc));
+            if (uRc >= 0)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                uRc = libusb_control_transfer(ctx->handle, 0x00, 0x09, 1, 0, nullptr, 0, 1000);
+                rayneoLog("raw set_config(1) rc=%d (%s)\n", uRc, uRc >= 0 ? "ok" : rayneoUsbErr(uRc));
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                libusb_release_interface(ctx->handle, ctx->interfaceNumber);
+                int cRc = LIBUSB_ERROR_BUSY;
+                for (int rAttempt = 0; rAttempt < 30; rAttempt++)
+                {
+                    cRc = libusb_claim_interface(ctx->handle, ctx->interfaceNumber);
+                    if (cRc != LIBUSB_ERROR_BUSY)
+                        break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                rayneoLog("re-claim after reconfigure rc=%d (%s)\n", cRc, cRc == 0 ? "ok" : rayneoUsbErr(cRc));
+                if (cRc != 0)
+                {
+                    libusb_close(ctx->handle);
+                    ctx->handle = nullptr;
+                    libusb_exit(ctx->usbCtx);
+                    ctx->usbCtx = nullptr;
+                    ctx->running.store(false);
+                    return RAYNEO_ERR_IO;
+                }
+                sRc = libusb_interrupt_transfer(ctx->handle, ctx->epIn, chk, 64, &chkLen, 1500);
+                rayneoLog("stream check after reconfigure rc=%d len=%d type=0x%02x\n", sRc, chkLen,
+                          (sRc == 0 && chkLen > 1) ? chk[1] : 0);
+                if (sRc == 0 && chkLen >= 2 && chk[1] == RAYNEO_PROTO_ACK_IMU_DATA)
+                {
+                    ctx->imuEnabled = true;
+                    imuRunning = true;
+                }
+            }
         }
         // RayNeo GT: under Linux (seen in a VirtualBox VM) its interrupt OUT
         // endpoint NAKed every write, so commands timed out, until it was cleared;
@@ -1017,15 +1209,27 @@ RAYNEO_Result Rayneo_Start(RAYNEO_Context ctx, uint32_t /*serviceFlags*/)
             
             if (tr->status == LIBUSB_TRANSFER_COMPLETED)
             {
-                if (tr->actual_length >= 2)
+                if (tr->actual_length < 64)
                 {
-                    // Show first bytes even if <64 to debug filtering
-                    
+                    rayneoLog("in-transfer short frame len=%u type=0x%02x\n",
+                              (unsigned)tr->actual_length,
+                              tr->actual_length > 1 ? tr->buffer[1] : 0);
                 }
                 if (tr->actual_length >= 64)
                 {
                     processInboundFrame(ctx, tr->buffer, static_cast<size_t>(tr->actual_length));
                 }
+            }
+            else
+            {
+                rayneoLog("in-transfer status=%d (%s)\n", (int)tr->status,
+                          tr->status == LIBUSB_TRANSFER_COMPLETED ? "COMPLETED" :
+                          tr->status == LIBUSB_TRANSFER_ERROR ? "ERROR" :
+                          tr->status == LIBUSB_TRANSFER_TIMED_OUT ? "TIMED_OUT" :
+                          tr->status == LIBUSB_TRANSFER_CANCELLED ? "CANCELLED" :
+                          tr->status == LIBUSB_TRANSFER_STALL ? "STALL" :
+                          tr->status == LIBUSB_TRANSFER_NO_DEVICE ? "NO_DEVICE" :
+                          tr->status == LIBUSB_TRANSFER_OVERFLOW ? "OVERFLOW" : "UNKNOWN");
             }
             ctx->transferDone.store(true);
             if (!ctx->stopWorker.load() && ctx->transferResubmit.load())
@@ -1045,7 +1249,7 @@ RAYNEO_Result Rayneo_Start(RAYNEO_Context ctx, uint32_t /*serviceFlags*/)
         ctx->transferDone.store(false);
         ctx->transferResubmit.store(true);
         int submitRc = libusb_submit_transfer(ctx->inTransfer);
-        (void)submitRc;
+        rayneoLog("submit in-transfer rc=%d (%s)\n", submitRc, submitRc == 0 ? "ok" : rayneoUsbErr(submitRc));
         ctx->worker = std::thread([ctx]() 
         {
             while (!ctx->stopWorker.load())
@@ -1155,7 +1359,8 @@ RAYNEO_Result Rayneo_SendRaw(RAYNEO_Context ctx, const uint8_t frame[64])
     if (ctx->epOut)
     {
         rc = libusb_interrupt_transfer(ctx->handle, ctx->epOut, const_cast<uint8_t *>(frame), 64, &transferred, 500);
-        
+        rayneoLog("interrupt OUT rc=%d (%s) transferred=%d cmd=0x%02x\n", rc, rc == 0 ? "ok" : rayneoUsbErr(rc), transferred, frame[1]);
+
         if (rc == 0 && transferred == 64)
             return RAYNEO_OK;
     }
@@ -1163,7 +1368,8 @@ RAYNEO_Result Rayneo_SendRaw(RAYNEO_Context ctx, const uint8_t frame[64])
     uint16_t wValue = (0x02 << 8) | 0x00; // Output report
     rc = libusb_control_transfer(ctx->handle, 0x21, 0x09, wValue, ctx->interfaceNumber >= 0 ? ctx->interfaceNumber : 0,
                                  const_cast<uint8_t *>(frame), 64, 500);
-    
+    rayneoLog("control SET_REPORT rc=%d (%s) cmd=0x%02x\n", rc, rc == 64 ? "ok" : rayneoUsbErr(rc), frame[1]);
+
     if (rc == 64)
         return RAYNEO_OK;
     return RAYNEO_ERR_IO;
@@ -1230,11 +1436,24 @@ RAYNEO_Result Rayneo_EnableImu(RAYNEO_Context ctx)
 {
     if (!ctx)
         return RAYNEO_ERR_INVALID_ARG;
+    // Rayneo_Start already turns the IMU on during bring-up; sending the
+    // command again would only fail while the stream is running.
+    if (ctx->imuEnabled.load())
+        return RAYNEO_OK;
     // Command 0x01 = IMU ON (по соглашению из клиента)
-    return Rayneo_SendCommand(ctx, kCmdImuOn, 0x00, nullptr, 0);
+    RAYNEO_Result rc = Rayneo_SendCommand(ctx, kCmdImuOn, 0x00, nullptr, 0);
+    if (rc == RAYNEO_OK)
+        ctx->imuEnabled = true;
+    return rc;
 }
 
-RAYNEO_Result Rayneo_DisableImu(RAYNEO_Context ctx) { return Rayneo_SendCommand(ctx, kCmdImuOff, 0x00, nullptr, 0); }
+RAYNEO_Result Rayneo_DisableImu(RAYNEO_Context ctx)
+{
+    if (!ctx)
+        return RAYNEO_ERR_INVALID_ARG;
+    ctx->imuEnabled = false;
+    return Rayneo_SendCommand(ctx, kCmdImuOff, 0x00, nullptr, 0);
+}
 RAYNEO_Result Rayneo_RequestDeviceInfo(RAYNEO_Context ctx)
 {
     if (!ctx)
